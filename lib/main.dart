@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
@@ -22,6 +23,7 @@ const String kActivationRelease = 'tea-v1-device-activation';
 const String kActivationAppKey = 'tea_stall_pos_android';
 const String kActivationAppLabel = 'Tea Stall POS';
 const String kActivationSecret = 'HINGLA-ACT-2026-KOT';
+const int kActivationValidDays = 30;
 const String kSyncApiBase = String.fromEnvironment('SYNC_API_BASE', defaultValue: '');
 
 T? firstOrNull<T>(Iterable<T> values) {
@@ -76,11 +78,15 @@ class ActivationService {
     required String shopName,
     required String mobileNumber,
     required String deviceId,
+    String? renewalPeriod,
   }) {
+    final now = DateTime.now();
+    final period = renewalPeriod ?? '${now.year}${now.month.toString().padLeft(2, '0')}';
     final seed = [
       shopName.trim().toUpperCase(),
       normalizeMobile(mobileNumber),
       deviceId.trim().toUpperCase(),
+      period,
       kActivationSecret,
     ].join('|');
     return _formatCode(_tokenFromSeed('REQ|$seed', 16));
@@ -199,6 +205,7 @@ class _ActivationPageState extends State<ActivationPage> {
       'deviceId': store.deviceCode,
       'deviceLabel': 'Android - Tea Stall POS',
       'requestCode': code,
+      'validDays': kActivationValidDays,
       'generatedAt': DateTime.now().toIso8601String(),
     });
   }
@@ -236,7 +243,11 @@ class _ActivationPageState extends State<ActivationPage> {
                 const SizedBox(height: 8),
                 const Text('Device Activation', style: TextStyle(fontSize: 28, fontWeight: FontWeight.w900)),
                 const SizedBox(height: 8),
-                const Text('Enter shop details, show this QR code to the admin/master mobile, then enter the activation code.'),
+                Text(
+                  store.activationApprovedOn.isNotEmpty && !store.activated
+                      ? 'Activation expired. Renew this device from the admin/master mobile to continue.'
+                      : 'Enter shop details, show this QR code to the admin/master mobile, then enter the activation code.',
+                ),
                 const SizedBox(height: 16),
                 TextField(
                   controller: shopController,
@@ -405,6 +416,17 @@ class ReportData {
   final int pendingKatha;
   final int openSittingCount;
   final List<MapEntry<String, int>> topItems;
+
+  Map<String, dynamic> toJson() => {
+        'totalSales': totalSales,
+        'cashReceived': cashReceived,
+        'upiReceived': upiReceived,
+        'kathaAdded': kathaAdded,
+        'kathaReceived': kathaReceived,
+        'pendingKatha': pendingKatha,
+        'openSittingCount': openSittingCount,
+        'topItems': topItems.map((entry) => {'name': entry.key, 'qty': entry.value}).toList(),
+      };
 }
 
 class PosStore extends ChangeNotifier {
@@ -414,14 +436,17 @@ class PosStore extends ChangeNotifier {
   bool _syncInProgress = false;
   bool ready = false;
   bool activated = false;
+  bool cloudSyncEnabled = false;
   String shopDisplayName = 'Tea Stall POS';
   String currencySymbol = rupee;
+  String reportOwnerEmails = '';
   String deviceCode = '';
   String activationShopName = '';
   String activationMobileNumber = '';
   String activationDeviceId = '';
   String activationRequestCode = '';
   String activationApprovedOn = '';
+  String activationExpiryMessage = '';
   String cloudShopId = '';
   String registeredCloudDeviceId = '';
   String syncStatus = 'Not started';
@@ -504,12 +529,15 @@ class PosStore extends ChangeNotifier {
     final map = {for (final row in rows) row['key'] as String: (row['value'] as String?) ?? ''};
     shopDisplayName = map['shop_display_name'] ?? shopDisplayName;
     currencySymbol = map['currency_symbol'] ?? currencySymbol;
-    activated = map['activated_release'] == kActivationRelease;
+    reportOwnerEmails = map['report_owner_emails'] ?? '';
+    cloudSyncEnabled = map['cloud_sync_enabled'] == 'true';
     activationShopName = map['activation_shop_name'] ?? '';
     activationMobileNumber = map['activation_mobile_number'] ?? '';
     activationDeviceId = map['activation_device_id'] ?? deviceCode;
     activationRequestCode = map['activation_request_code'] ?? '';
     activationApprovedOn = map['activation_approved_on'] ?? '';
+    activated = map['activated_release'] == kActivationRelease && !_isActivationExpired(activationApprovedOn);
+    activationExpiryMessage = _activationExpiryMessage();
     cloudShopId = map['cloud_shop_id'] ?? '';
     registeredCloudDeviceId = map['registered_cloud_device_id'] ?? '';
     final syncRows = await _db!.query('sync_state', where: 'key = ?', whereArgs: ['last_pulled_event_id'], limit: 1);
@@ -520,6 +548,32 @@ class PosStore extends ChangeNotifier {
       await _db!.insert('app_settings', {'key': 'sync_replay_v2_done', 'value': 'true'}, conflictAlgorithm: ConflictAlgorithm.replace);
     }
     pendingSyncCount = Sqflite.firstIntValue(await _db!.rawQuery('SELECT COUNT(*) FROM sync_outbox WHERE sent = 0')) ?? 0;
+  }
+
+  bool _isActivationExpired(String approvedOn) {
+    final approved = DateTime.tryParse(approvedOn);
+    if (approved == null) return true;
+    return DateTime.now().isAfter(approved.add(const Duration(days: kActivationValidDays)));
+  }
+
+  DateTime? get activationExpiresAt {
+    final approved = DateTime.tryParse(activationApprovedOn);
+    return approved?.add(const Duration(days: kActivationValidDays));
+  }
+
+  int get activationDaysLeft {
+    final expires = activationExpiresAt;
+    if (expires == null) return 0;
+    final hours = expires.difference(DateTime.now()).inHours;
+    if (hours <= 0) return 0;
+    return (hours / 24).ceil();
+  }
+
+  String _activationExpiryMessage() {
+    final expires = activationExpiresAt;
+    if (expires == null) return 'Activation required';
+    if (!activated) return 'Expired on ${DateFormat('dd MMM yyyy').format(expires)}';
+    return 'Expires on ${DateFormat('dd MMM yyyy').format(expires)} ($activationDaysLeft days left)';
   }
 
   Future<bool> activateWithCode({required String shopName, required String mobileNumber, required String activationCode}) async {
@@ -560,6 +614,7 @@ class PosStore extends ChangeNotifier {
     activationDeviceId = deviceCode;
     activationRequestCode = requestCode;
     activationApprovedOn = values['activation_approved_on']!;
+    activationExpiryMessage = _activationExpiryMessage();
     notifyListeners();
     _startSyncLoop();
     return true;
@@ -611,6 +666,7 @@ class PosStore extends ChangeNotifier {
     activationMobileNumber = '';
     activationRequestCode = '';
     activationApprovedOn = '';
+    activationExpiryMessage = 'Activation required';
     cloudShopId = '';
     registeredCloudDeviceId = '';
     notifyListeners();
@@ -623,6 +679,102 @@ class PosStore extends ChangeNotifier {
     currencySymbol = cleanCurrency;
     await _db!.insert('app_settings', {'key': 'shop_display_name', 'value': shopDisplayName}, conflictAlgorithm: ConflictAlgorithm.replace);
     await _db!.insert('app_settings', {'key': 'currency_symbol', 'value': currencySymbol}, conflictAlgorithm: ConflictAlgorithm.replace);
+    notifyListeners();
+  }
+
+  Future<void> saveReportEmails(String emails) async {
+    reportOwnerEmails = emails.trim();
+    await _db!.insert('app_settings', {'key': 'report_owner_emails', 'value': reportOwnerEmails}, conflictAlgorithm: ConflictAlgorithm.replace);
+    notifyListeners();
+  }
+
+  List<String> get reportEmailList => reportOwnerEmails
+      .split(RegExp(r'[,\n;]'))
+      .map((email) => email.trim())
+      .where((email) => email.contains('@') && email.contains('.'))
+      .toList();
+
+  Future<String> backupItemsToDownloads() async {
+    final rows = await _db!.query('items', orderBy: 'category, name, price');
+    final dir = await _teaStallDownloadDir();
+    if (!await dir.exists()) await dir.create(recursive: true);
+    final stamp = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
+    final file = File(p.join(dir.path, 'items_backup_$stamp.json'));
+    await file.writeAsString(const JsonEncoder.withIndent('  ').convert({
+      'type': 'tea_stall_pos_items_backup',
+      'version': 1,
+      'createdAt': DateTime.now().toIso8601String(),
+      'items': rows,
+    }));
+    return file.path;
+  }
+
+  Future<int> restoreItemsFromFilePicker() async {
+    final picked = await FilePicker.platform.pickFiles(
+      dialogTitle: 'Select Tea Stall items backup',
+      type: FileType.custom,
+      allowedExtensions: ['json'],
+      withData: true,
+    );
+    if (picked == null || picked.files.isEmpty) {
+      throw Exception('No backup file selected');
+    }
+    final selected = picked.files.single;
+    final content = selected.bytes != null ? utf8.decode(selected.bytes!) : await File(selected.path!).readAsString();
+    final decoded = jsonDecode(content);
+    if (decoded is! Map || decoded['type'] != 'tea_stall_pos_items_backup' || decoded['items'] is! List) {
+      throw Exception('Invalid items backup file');
+    }
+    final now = DateTime.now().millisecondsSinceEpoch;
+    var restored = 0;
+    for (final raw in decoded['items'] as List) {
+      if (raw is! Map) continue;
+      final name = (raw['name'] ?? '').toString().trim();
+      final category = (raw['category'] ?? 'Other').toString().trim();
+      final price = intValue(raw['price']);
+      if (name.isEmpty || category.isEmpty || price <= 0) continue;
+      final values = {
+        'name': name,
+        'category': category,
+        'price': price,
+        'isFavorite': intValue(raw['isFavorite'], raw['isFavorite'] == true ? 1 : 0),
+        'isActive': intValue(raw['isActive'], raw['isActive'] == false ? 0 : 1),
+        'updatedAt': now,
+      };
+      final existing = await _db!.query('items', where: 'name = ? AND category = ?', whereArgs: [name, category], limit: 1);
+      if (existing.isEmpty) {
+        final id = await _db!.insert('items', {...values, 'createdAt': now});
+        await _rememberRemote('$deviceCode:item:$id', 'item', id);
+      } else {
+        await _db!.update('items', values, where: 'id = ?', whereArgs: [existing.first['id']]);
+      }
+      restored++;
+    }
+    await reload();
+    return restored;
+  }
+
+  Future<Directory> _teaStallDownloadDir() async {
+    if (Platform.isAndroid) {
+      return Directory('/storage/emulated/0/Download/TeaStallPOS');
+    }
+    final home = Platform.environment['USERPROFILE'] ?? Platform.environment['HOME'] ?? Directory.current.path;
+    return Directory(p.join(home, 'Downloads', 'TeaStallPOS'));
+  }
+
+  Future<void> setCloudSyncEnabled(bool enabled) async {
+    cloudSyncEnabled = enabled;
+    await _db!.insert('app_settings', {'key': 'cloud_sync_enabled', 'value': enabled ? 'true' : 'false'}, conflictAlgorithm: ConflictAlgorithm.replace);
+    if (enabled) {
+      syncStatus = 'Cloud sync enabled';
+      _startSyncLoop();
+    } else {
+      _syncTimer?.cancel();
+      _syncKickTimer?.cancel();
+      _syncInProgress = false;
+      syncStatus = 'Cloud sync off';
+      syncError = '';
+    }
     notifyListeners();
   }
 
@@ -639,13 +791,13 @@ class PosStore extends ChangeNotifier {
 
   void _startSyncLoop() {
     _syncTimer?.cancel();
-    if (!activated || kSyncApiBase.isEmpty) return;
+    if (!activated || !cloudSyncEnabled || kSyncApiBase.isEmpty) return;
     _scheduleSyncSoon();
     _syncTimer = Timer.periodic(const Duration(seconds: 2), (_) => syncNow());
   }
 
   void _scheduleSyncSoon() {
-    if (!activated || kSyncApiBase.isEmpty) return;
+    if (!activated || !cloudSyncEnabled || kSyncApiBase.isEmpty) return;
     _syncKickTimer?.cancel();
     _syncKickTimer = Timer(const Duration(milliseconds: 300), () => unawaited(syncNow()));
   }
@@ -670,6 +822,12 @@ class PosStore extends ChangeNotifier {
   Future<void> syncNow() async {
     try {
       if (_syncInProgress) return;
+      if (!cloudSyncEnabled) {
+        syncStatus = 'Cloud sync off';
+        syncError = '';
+        notifyListeners();
+        return;
+      }
       if (kSyncApiBase.isEmpty) {
         syncStatus = 'Sync API URL missing';
         syncError = 'Build APK with --dart-define=SYNC_API_BASE=...';
@@ -751,6 +909,11 @@ class PosStore extends ChangeNotifier {
   }
 
   Future<void> forceFullResync() async {
+    if (!cloudSyncEnabled) {
+      syncStatus = 'Turn on cloud sync first';
+      notifyListeners();
+      return;
+    }
     cloudShopId = '';
     registeredCloudDeviceId = '';
     lastPulledEventId = 0;
@@ -1037,6 +1200,28 @@ class PosStore extends ChangeNotifier {
     return id;
   }
 
+  Future<void> updateSittingIdentity(int sessionId, String identity) async {
+    final clean = identity.trim().isEmpty ? 'Sitting $sessionId' : identity.trim();
+    final rows = await _db!.query('katha_sessions', where: 'id = ? AND type = ?', whereArgs: [sessionId, 'SITTING'], limit: 1);
+    if (rows.isEmpty) return;
+    final row = rows.first;
+    await _db!.update('katha_sessions', {'label': clean}, where: 'id = ?', whereArgs: [sessionId]);
+    final sessionClientId = await _clientIdFor('session', sessionId);
+    await enqueueSync('session', sessionClientId, 'upsert', {
+      'label': clean,
+      'type': row['type'],
+      'status': row['status'],
+      'totalAmount': row['totalAmount'],
+      'paidAmount': row['paidAmount'],
+      'balanceAmount': row['balanceAmount'],
+      'lastAddedItem': row['lastAddedItem'],
+      'createdAt': row['createdAt'],
+      'closedAt': row['closedAt'],
+    });
+    await reload();
+    _scheduleSyncSoon();
+  }
+
   Future<void> addItemToSession(int sessionId, Item item, [int qty = 1]) async {
     final now = DateTime.now().millisecondsSinceEpoch;
     final total = item.price * qty;
@@ -1207,6 +1392,14 @@ class PosStore extends ChangeNotifier {
     await _queueCustomer(customerId);
     await reload();
     _scheduleSyncSoon();
+  }
+
+  Future<void> settlePermanentCustomer(int customerId, String mode) async {
+    final rows = await _db!.query('customers', where: 'id = ?', whereArgs: [customerId], limit: 1);
+    if (rows.isEmpty) return;
+    final balance = intValue(rows.first['currentBalance']);
+    if (balance <= 0) return;
+    await receivePayment(customerId, balance, mode);
   }
 
   Future<void> _queueCustomer(int customerId) async {
@@ -1397,6 +1590,36 @@ class PosStore extends ChangeNotifier {
       topItems: topRows.map((row) => MapEntry(row['name'] as String, row['qty'] as int)).toList(),
     );
   }
+
+  Future<void> emailTodayReport() async {
+    if (kSyncApiBase.isEmpty) throw Exception('Cloud API is not configured');
+    if (cloudShopId.isEmpty) throw Exception('Cloud activation is not linked yet. Turn on Cloud Sync once and sync.');
+    final recipients = reportEmailList;
+    if (recipients.isEmpty) throw Exception('Add owner email in Settings first');
+    final report = await reportsToday();
+    final res = await http
+        .post(
+          Uri.parse('$kSyncApiBase/api/reports/email'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'shopName': shopDisplayName,
+            'shopId': cloudShopId,
+            'deviceId': deviceCode,
+            'reportDate': DateFormat('dd MMM yyyy').format(DateTime.now()),
+            'recipients': recipients,
+            'report': report.toJson(),
+          }),
+        )
+        .timeout(const Duration(seconds: 20));
+    if (res.statusCode >= 400) {
+      String message = 'Email failed';
+      try {
+        final body = jsonDecode(res.body) as Map<String, dynamic>;
+        message = (body['error'] ?? message).toString();
+      } catch (_) {}
+      throw Exception(message);
+    }
+  }
 }
 
 extension CartGroup on List<Item> {
@@ -1443,14 +1666,793 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin {
-  late final TabController controller = TabController(length: 3, vsync: this, initialIndex: 1);
+enum CounterMode { quick, sitting, permanent }
+
+class _HomePageState extends State<HomePage> {
+  final quickCart = <Item>[];
+  bool billOpen = false;
+  String? openCategory;
+  CounterMode mode = CounterMode.quick;
+  int? selectedSittingId;
+  int? selectedPermanentId;
+
   @override
   Widget build(BuildContext context) {
     final store = context.watch<PosStore>();
-    return Scaffold(
-      appBar: AppBar(title: Text(store.shopDisplayName), bottom: TabBar(controller: controller, tabs: const [Tab(text: 'Quick'), Tab(text: 'Sitting'), Tab(text: 'Permanent')])),
-      body: TabBarView(controller: controller, children: const [QuickSalePage(), SittingPage(), CustomersPage(embed: true)]),
+    final selectedSitting = selectedSittingId == null ? null : firstOrNull(store.openSessions.where((s) => s.id == selectedSittingId));
+    final selectedPermanent = selectedPermanentId == null ? null : firstOrNull(store.customers.where((c) => c.id == selectedPermanentId));
+    if (selectedSittingId != null && selectedSitting == null && mode == CounterMode.sitting) {
+      selectedSittingId = null;
+      mode = CounterMode.quick;
+    }
+    if (selectedPermanentId != null && selectedPermanent == null && mode == CounterMode.permanent) {
+      selectedPermanentId = null;
+      mode = CounterMode.quick;
+    }
+    final lines = _currentLines(store, selectedSitting, selectedPermanent);
+    final total = _currentTotal(selectedSitting, selectedPermanent, lines);
+    final targetTitle = _targetTitle(selectedSitting, selectedPermanent);
+    final grouped = store.groupedItems();
+    final categoryNames = _orderedCounterCategories(grouped.keys);
+
+    return PopScope(
+      canPop: !_hasBackTarget,
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop) _goBackOneStep();
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          title: Text(store.shopDisplayName),
+          leading: _hasBackTarget ? IconButton(onPressed: _goBackOneStep, icon: const Icon(Icons.arrow_back)) : null,
+          actions: [
+            Padding(
+              padding: const EdgeInsets.only(right: 12),
+              child: Center(child: Text(store.syncStatus.startsWith('Synced') ? 'Online' : 'Sync', style: const TextStyle(fontWeight: FontWeight.w700))),
+            ),
+          ],
+        ),
+        body: SafeArea(
+          child: Column(children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 6),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(8),
+              onTap: () => setState(() => billOpen = !billOpen),
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                decoration: BoxDecoration(
+                  color: const Color(0xff0f766e),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(children: [
+                  Expanded(child: Text(targetTitle, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w900))),
+                  Text('$rupee$total', style: const TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.w900)),
+                  Icon(billOpen ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down, color: Colors.white),
+                ]),
+              ),
+            ),
+          ),
+          AnimatedContainer(
+            duration: const Duration(milliseconds: 180),
+            height: billOpen ? 180 : 0,
+            curve: Curves.easeOut,
+            child: billOpen ? _CounterBillList(lines: lines, total: total, onAdd: (line) => _addLine(store, line), onMinus: (line) => _minusLine(store, line)) : const SizedBox.shrink(),
+          ),
+          if (mode == CounterMode.permanent && selectedPermanent != null)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
+              child: Row(children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: () => _showPermanentHistory(store, selectedPermanent),
+                    icon: const Icon(Icons.history),
+                    label: const Text('History'),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: FilledButton(
+                    onPressed: selectedPermanent.balance <= 0 ? null : () => _showPermanentPaymentDialog(store, selectedPermanent, 'CASH'),
+                    child: const Text('Partial Cash'),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: FilledButton(
+                    onPressed: selectedPermanent.balance <= 0 ? null : () => _showPermanentPaymentDialog(store, selectedPermanent, 'UPI'),
+                    child: const Text('Partial UPI'),
+                  ),
+                ),
+              ]),
+            ),
+          Expanded(
+            child: GestureDetector(
+              behavior: HitTestBehavior.translucent,
+              onTap: _clearSelection,
+              child: ListView(
+                padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+                children: [
+                  _SittingBoxGrid(
+                    sessions: store.openSessions,
+                    selectedId: mode == CounterMode.sitting ? selectedSittingId : null,
+                    onNew: () async {
+                      final id = await store.newSitting('Sitting ${store.openSessions.length + 1}', '');
+                      if (!mounted) return;
+                      setState(() {
+                        mode = CounterMode.sitting;
+                        selectedSittingId = id;
+                        selectedPermanentId = null;
+                        quickCart.clear();
+                      });
+                    },
+                    onSelect: (session) => setState(() {
+                      mode = CounterMode.sitting;
+                      selectedSittingId = session.id;
+                      selectedPermanentId = null;
+                    }),
+                    onIdentity: (session) => _showSittingIdentityDialog(store, session),
+                  ),
+                  if (mode == CounterMode.permanent) ...[
+                    const SizedBox(height: 8),
+                    _PermanentStrip(
+                      customers: store.customers,
+                      selectedId: selectedPermanentId,
+                      onAdd: () => showCustomerDialog(context),
+                      onClose: _clearSelection,
+                      onSelect: (customer) => setState(() {
+                        selectedPermanentId = customer.id;
+                        mode = CounterMode.permanent;
+                        selectedSittingId = null;
+                        unawaited(store.loadLedger(customer.id));
+                      }),
+                      onHistory: (customer) => _showPermanentHistory(store, customer),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ),
+          if (openCategory != null)
+            _CounterItemPanel(
+              title: openCategory!,
+              items: grouped[openCategory!] ?? const [],
+              count: (item) => _itemCount(item, lines),
+              onPlus: (item) => _addItem(store, item),
+              onMinus: (item) => _minusItem(store, item),
+              onClose: () => setState(() => openCategory = null),
+            ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(10, 4, 10, 4),
+            child: Row(
+              children: [
+                Expanded(
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: Row(children: [
+                      for (final category in categoryNames) ...[
+                        _RoundCategoryButton(
+                            label: _shortCategoryLabel(category),
+                            icon: _categoryIcon(category),
+                            selected: openCategory == category,
+                            onTap: () => setState(() => openCategory = openCategory == category ? null : category)),
+                        const SizedBox(width: 8),
+                      ],
+                    ]),
+                  ),
+                ),
+                const SizedBox(width: 6),
+                _RoundCategoryButton(
+                    label: 'P',
+                    icon: Icons.person,
+                    selected: mode == CounterMode.permanent,
+                    onTap: () {
+                      if (mode == CounterMode.permanent) {
+                        _clearSelection();
+                        return;
+                      }
+                      setState(() {
+                          mode = CounterMode.permanent;
+                          selectedSittingId = null;
+                          openCategory = null;
+                      });
+                    }),
+              ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(10, 2, 10, 10),
+            child: Row(children: [
+              Expanded(child: FilledButton(onPressed: total <= 0 ? null : () => _pay(store, 'CASH'), child: const Text('Cash'))),
+              const SizedBox(width: 10),
+              Expanded(child: FilledButton(onPressed: total <= 0 ? null : () => _pay(store, 'UPI'), child: const Text('UPI'))),
+            ]),
+          ),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  bool get _hasBackTarget => openCategory != null || billOpen || mode != CounterMode.quick || selectedSittingId != null || selectedPermanentId != null;
+
+  void _goBackOneStep() {
+    setState(() {
+      if (openCategory != null) {
+        openCategory = null;
+        return;
+      }
+      if (billOpen) {
+        billOpen = false;
+        return;
+      }
+      if (mode != CounterMode.quick || selectedSittingId != null || selectedPermanentId != null) {
+        mode = CounterMode.quick;
+        selectedSittingId = null;
+        selectedPermanentId = null;
+      }
+    });
+  }
+
+  List<BillLine> _currentLines(PosStore store, Session? sitting, Customer? permanent) {
+    if (mode == CounterMode.sitting && sitting != null) return store.bills[sitting.id] ?? const [];
+    if (mode == CounterMode.permanent && permanent != null) return store.permanentBills[permanent.id] ?? const [];
+    return cartToLines(quickCart);
+  }
+
+  int _currentTotal(Session? sitting, Customer? permanent, List<BillLine> lines) {
+    if (mode == CounterMode.sitting && sitting != null) return sitting.total;
+    if (mode == CounterMode.permanent && permanent != null) return permanent.balance;
+    return lines.fold(0, (sum, line) => sum + line.total);
+  }
+
+  String _targetTitle(Session? sitting, Customer? permanent) {
+    if (mode == CounterMode.sitting && sitting != null) return 'Current Bill #${sitting.id}';
+    if (mode == CounterMode.permanent && permanent != null) return '${permanent.name} Due';
+    if (mode == CounterMode.permanent) return 'Permanent Katha';
+    return 'Current Bill';
+  }
+
+  Future<void> _addItem(PosStore store, Item item) async {
+    if (mode == CounterMode.sitting && selectedSittingId != null) {
+      await store.addItemToSession(selectedSittingId!, item);
+      return;
+    }
+    if (mode == CounterMode.permanent && selectedPermanentId != null) {
+      await store.addPermanentItem(selectedPermanentId!, item);
+      await store.loadLedger(selectedPermanentId!);
+      return;
+    }
+    if (mode == CounterMode.permanent) return;
+    setState(() => quickCart.add(item));
+  }
+
+  Future<void> _minusItem(PosStore store, Item item) async {
+    final lines = _currentLines(
+      store,
+      selectedSittingId == null ? null : firstOrNull(store.openSessions.where((s) => s.id == selectedSittingId)),
+      selectedPermanentId == null ? null : firstOrNull(store.customers.where((c) => c.id == selectedPermanentId)),
+    );
+    final line = firstOrNull(lines.where((l) => l.itemId == item.id));
+    if (line == null) return;
+    await _minusLine(store, line);
+  }
+
+  Future<void> _addLine(PosStore store, BillLine line) async {
+    if (line.itemId == null) return;
+    final item = firstOrNull(store.items.where((e) => e.id == line.itemId));
+    if (item != null) await _addItem(store, item);
+  }
+
+  Future<void> _minusLine(PosStore store, BillLine line) async {
+    if (mode == CounterMode.sitting && selectedSittingId != null) {
+      await store.removeOneFromSession(selectedSittingId!, line);
+      return;
+    }
+    if (mode == CounterMode.permanent && selectedPermanentId != null) {
+      await store.removePermanentItem(selectedPermanentId!, line);
+      await store.loadLedger(selectedPermanentId!);
+      return;
+    }
+    setState(() => quickCart.remove(quickCart.lastWhere((e) => e.id == line.itemId)));
+  }
+
+  int _itemCount(Item item, List<BillLine> lines) => firstOrNull(lines.where((line) => line.itemId == item.id))?.qty ?? 0;
+
+  Future<void> _pay(PosStore store, String modeName) async {
+    if (mode == CounterMode.sitting && selectedSittingId != null) {
+      await store.closeSession(selectedSittingId!, modeName);
+      setState(() {
+        selectedSittingId = null;
+        mode = CounterMode.quick;
+        billOpen = false;
+      });
+      return;
+    }
+    if (mode == CounterMode.permanent && selectedPermanentId != null) {
+      final customer = firstOrNull(store.customers.where((c) => c.id == selectedPermanentId));
+      if (customer != null && customer.balance > 0) await _showPermanentPaymentDialog(store, customer, modeName);
+      return;
+    }
+    if (quickCart.isNotEmpty) {
+      await store.quickSale(quickCart, modeName);
+      setState(() {
+        quickCart.clear();
+        billOpen = false;
+      });
+    }
+  }
+
+  Future<void> _showPermanentPaymentDialog(PosStore store, Customer customer, String modeName) async {
+    final controller = TextEditingController(text: '${customer.balance}');
+    final amount = await showDialog<int>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text('$modeName payment'),
+        content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('${customer.name} due: $rupee${customer.balance}', style: const TextStyle(fontWeight: FontWeight.w800)),
+          const SizedBox(height: 10),
+          TextField(
+            controller: controller,
+            autofocus: true,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(labelText: 'Paid amount'),
+          ),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')),
+          OutlinedButton(onPressed: () => Navigator.pop(dialogContext, customer.balance), child: const Text('Full')),
+          FilledButton(onPressed: () => Navigator.pop(dialogContext, int.tryParse(controller.text) ?? 0), child: const Text('Save')),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (amount == null || amount <= 0) return;
+    await store.receivePayment(customer.id, math.min(amount, customer.balance), modeName);
+    await store.loadLedger(customer.id);
+  }
+
+  Future<void> _showSittingIdentityDialog(PosStore store, Session session) async {
+    final controller = TextEditingController(text: _sittingIdentityText(session));
+    final identity = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text('Sitting ${session.id} identity'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          textCapitalization: TextCapitalization.words,
+          decoration: const InputDecoration(labelText: 'Shirt color, bike, table no.'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')),
+          TextButton(onPressed: () => Navigator.pop(dialogContext, ''), child: const Text('Clear')),
+          FilledButton(onPressed: () => Navigator.pop(dialogContext, controller.text), child: const Text('Save')),
+        ],
+      ),
+    );
+    controller.dispose();
+    if (identity == null) return;
+    await store.updateSittingIdentity(session.id, identity);
+  }
+
+  Future<void> _showPermanentHistory(PosStore store, Customer customer) async {
+    await store.loadLedger(customer.id);
+    if (!mounted) return;
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (sheetContext) {
+        return SafeArea(
+          child: DraggableScrollableSheet(
+            expand: false,
+            initialChildSize: 0.75,
+            minChildSize: 0.35,
+            maxChildSize: 0.95,
+            builder: (context, scrollController) {
+              return Consumer<PosStore>(
+                builder: (context, liveStore, _) {
+                  final liveCustomer = firstOrNull(liveStore.customers.where((c) => c.id == customer.id)) ?? customer;
+                  final grouped = <String, List<Ledger>>{};
+                  for (final entry in liveStore.ledger) {
+                    final day = DateFormat('dd MMM yyyy').format(DateTime.fromMillisecondsSinceEpoch(entry.createdAt));
+                    grouped.putIfAbsent(day, () => []).add(entry);
+                  }
+                  return Column(children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                      child: Row(children: [
+                        Expanded(child: Text('${liveCustomer.name} - $rupee${liveCustomer.balance}', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w900))),
+                        IconButton(onPressed: () => Navigator.pop(sheetContext), icon: const Icon(Icons.close)),
+                      ]),
+                    ),
+                    Row(children: [
+                      Expanded(child: Padding(padding: const EdgeInsets.symmetric(horizontal: 8), child: FilledButton(onPressed: liveCustomer.balance <= 0 ? null : () => _showPermanentPaymentDialog(liveStore, liveCustomer, 'CASH'), child: const Text('Partial Cash')))),
+                      Expanded(child: Padding(padding: const EdgeInsets.symmetric(horizontal: 8), child: FilledButton(onPressed: liveCustomer.balance <= 0 ? null : () => _showPermanentPaymentDialog(liveStore, liveCustomer, 'UPI'), child: const Text('Partial UPI')))),
+                    ]),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
+                      child: Row(children: [
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: liveCustomer.balance <= 0
+                                ? null
+                                : () async {
+                                    await liveStore.settlePermanentCustomer(liveCustomer.id, 'CASH');
+                                    await liveStore.loadLedger(liveCustomer.id);
+                                  },
+                            icon: const Icon(Icons.done_all),
+                            label: const Text('Clear Cash'),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: OutlinedButton.icon(
+                            onPressed: liveCustomer.balance <= 0
+                                ? null
+                                : () async {
+                                    await liveStore.settlePermanentCustomer(liveCustomer.id, 'UPI');
+                                    await liveStore.loadLedger(liveCustomer.id);
+                                  },
+                            icon: const Icon(Icons.done_all),
+                            label: const Text('Clear UPI'),
+                          ),
+                        ),
+                      ]),
+                    ),
+                    Expanded(
+                      child: grouped.isEmpty
+                          ? const Center(child: Text('No history yet'))
+                          : ListView(
+                              controller: scrollController,
+                              padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                              children: [
+                                for (final day in grouped.keys) ...[
+                                  Padding(
+                                    padding: const EdgeInsets.only(top: 10, bottom: 4),
+                                    child: Text(day, style: const TextStyle(fontWeight: FontWeight.w900)),
+                                  ),
+                                  for (final entry in grouped[day]!)
+                                    ListTile(
+                                      dense: true,
+                                      title: Text(entry.type == 'PAYMENT' ? 'Payment - ${entry.description}' : entry.description),
+                                      subtitle: Text(DateFormat('hh:mm a').format(DateTime.fromMillisecondsSinceEpoch(entry.createdAt))),
+                                      trailing: Text(
+                                        '${entry.type == 'PAYMENT' ? '-' : '+'}$rupee${entry.amount}',
+                                        style: TextStyle(fontWeight: FontWeight.w900, color: entry.type == 'PAYMENT' ? Colors.green : Colors.red),
+                                      ),
+                                    ),
+                                ],
+                              ],
+                            ),
+                    ),
+                  ]);
+                },
+              );
+            },
+          ),
+        );
+      },
+    );
+  }
+
+  void _clearSelection() {
+    setState(() {
+      mode = CounterMode.quick;
+      selectedSittingId = null;
+      selectedPermanentId = null;
+      openCategory = null;
+      billOpen = false;
+    });
+  }
+}
+
+List<String> _orderedCounterCategories(Iterable<String> categories) {
+  const preferred = ['Tea/Coffee', 'Cigarettes', 'Cool Drinks', 'Chocolates', 'Biscuits', 'Gutka/Pan Masala', 'Other'];
+  final set = categories.toSet();
+  return [...preferred.where(set.contains), ...set.where((c) => !preferred.contains(c)).toList()..sort()];
+}
+
+String _shortCategoryLabel(String category) {
+  if (category == 'Tea/Coffee') return 'Tea';
+  if (category == 'Gutka/Pan Masala') return 'Gutka';
+  if (category == 'Cool Drinks') return 'Cool';
+  if (category == 'Chocolates') return 'Choc';
+  if (category == 'Cigarettes') return 'Cig';
+  if (category == 'Biscuits') return 'Bisc';
+  if (category.toLowerCase().contains('juice')) return 'Juice';
+  if (category.toLowerCase().contains('water')) return 'Water';
+  if (category.toLowerCase().contains('snack')) return 'Snack';
+  if (category.toLowerCase().contains('chips')) return 'Chips';
+  if (category.toLowerCase().contains('sweet')) return 'Sweet';
+  return category.length <= 5 ? category : category.substring(0, 5);
+}
+
+IconData _categoryIcon(String category) {
+  final lower = category.toLowerCase();
+  if (lower.contains('tea') || lower.contains('coffee')) return Icons.local_cafe;
+  if (lower.contains('cigarette')) return Icons.smoking_rooms;
+  if (lower.contains('drink') || lower.contains('cool') || lower.contains('soda') || lower.contains('juice')) return Icons.local_drink;
+  if (lower.contains('chocolate')) return Icons.cookie;
+  if (lower.contains('biscuit')) return Icons.bakery_dining;
+  if (lower.contains('gutka') || lower.contains('pan')) return Icons.spa;
+  if (lower.contains('water')) return Icons.water_drop;
+  if (lower.contains('snack') || lower.contains('chips')) return Icons.fastfood;
+  if (lower.contains('sweet') || lower.contains('cake')) return Icons.cake;
+  if (lower.contains('milk')) return Icons.local_drink;
+  if (lower.contains('other')) return Icons.more_horiz;
+  return Icons.more_horiz;
+}
+
+class _SittingBoxGrid extends StatelessWidget {
+  const _SittingBoxGrid({required this.sessions, required this.selectedId, required this.onNew, required this.onSelect, required this.onIdentity});
+  final List<Session> sessions;
+  final int? selectedId;
+  final VoidCallback onNew;
+  final void Function(Session) onSelect;
+  final void Function(Session) onIdentity;
+
+  @override
+  Widget build(BuildContext context) {
+    final orderedSessions = [...sessions]..sort((a, b) => a.createdAt.compareTo(b.createdAt));
+    return GridView.builder(
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
+      itemCount: orderedSessions.length + 1,
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 4, mainAxisExtent: 68, mainAxisSpacing: 8, crossAxisSpacing: 8),
+      itemBuilder: (_, index) {
+        if (index == 0) {
+          return _CounterBox(onTap: onNew, amount: '+', idText: '', selected: false, isAdd: true);
+        }
+        final session = orderedSessions[index - 1];
+        return _CounterBox(
+          onTap: () => onSelect(session),
+          onLongPress: () => onIdentity(session),
+          amount: '$rupee${session.total}',
+          idText: '$index',
+          subtitle: _sittingIdentityText(session),
+          selected: selectedId == session.id,
+        );
+      },
+    );
+  }
+}
+
+String _sittingIdentityText(Session session) {
+  final label = session.label.trim();
+  if (label.isEmpty) return '';
+  if (RegExp(r'^Sitting\s+\d+$', caseSensitive: false).hasMatch(label)) return '';
+  if (label.toLowerCase() == 'sitting katha') return '';
+  return label;
+}
+
+class _CounterBox extends StatelessWidget {
+  const _CounterBox({required this.onTap, required this.amount, required this.idText, required this.selected, this.onLongPress, this.subtitle = '', this.isAdd = false});
+  final VoidCallback onTap;
+  final VoidCallback? onLongPress;
+  final String amount;
+  final String idText;
+  final String subtitle;
+  final bool selected;
+  final bool isAdd;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(8),
+      onTap: onTap,
+      onLongPress: onLongPress,
+      child: Container(
+        decoration: BoxDecoration(
+          color: selected ? const Color(0xffccfbf1) : Colors.white,
+          border: Border.all(color: selected ? const Color(0xff0f766e) : const Color(0xffd6d3d1), width: selected ? 2 : 1),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Stack(children: [
+          Center(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(4, 10, 4, 4),
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                Text(amount, maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(fontSize: isAdd ? 30 : 18, fontWeight: FontWeight.w900, color: isAdd ? const Color(0xff0f766e) : Colors.black)),
+                if (subtitle.isNotEmpty)
+                  Text(subtitle, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 10, fontWeight: FontWeight.w800, color: Color(0xff57534e))),
+              ]),
+            ),
+          ),
+          if (idText.isNotEmpty)
+            Positioned(
+              right: 4,
+              top: 4,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                decoration: BoxDecoration(color: const Color(0xff0f766e), borderRadius: BorderRadius.circular(999)),
+                child: Text(idText, style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold)),
+              ),
+            ),
+        ]),
+      ),
+    );
+  }
+}
+
+class _PermanentStrip extends StatelessWidget {
+  const _PermanentStrip({required this.customers, required this.selectedId, required this.onAdd, required this.onClose, required this.onSelect, required this.onHistory});
+  final List<Customer> customers;
+  final int? selectedId;
+  final VoidCallback onAdd;
+  final VoidCallback onClose;
+  final void Function(Customer) onSelect;
+  final void Function(Customer) onHistory;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        const Expanded(child: Text('Permanent Katha', style: TextStyle(fontWeight: FontWeight.w900))),
+        IconButton(onPressed: onClose, icon: const Icon(Icons.close)),
+      ]),
+      SizedBox(
+        height: 76,
+        child: ListView.separated(
+          scrollDirection: Axis.horizontal,
+          itemCount: customers.length + 1,
+          separatorBuilder: (context, index) => const SizedBox(width: 8),
+          itemBuilder: (_, index) {
+            if (index == 0) {
+              return SizedBox(width: 64, child: _CounterBox(onTap: onAdd, amount: '+', idText: 'P', selected: false, isAdd: true));
+            }
+            final customer = customers[index - 1];
+            return SizedBox(
+              width: 116,
+              child: GestureDetector(
+                onLongPress: () => onHistory(customer),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(8),
+                  onTap: () => onSelect(customer),
+                  child: Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: selectedId == customer.id ? const Color(0xffffedd5) : Colors.white,
+                      border: Border.all(color: selectedId == customer.id ? Colors.deepOrange : const Color(0xffd6d3d1), width: selectedId == customer.id ? 2 : 1),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisAlignment: MainAxisAlignment.center, children: [
+                      Row(children: [
+                        Expanded(child: Text(customer.name, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w900))),
+                        InkWell(onTap: () => onHistory(customer), child: const Icon(Icons.receipt_long, size: 16)),
+                      ]),
+                      Text('$rupee${customer.balance}', style: const TextStyle(color: Colors.red, fontWeight: FontWeight.w900)),
+                    ]),
+                  ),
+                ),
+              ),
+            );
+          },
+        ),
+      ),
+    ]);
+  }
+}
+
+class _RoundCategoryButton extends StatelessWidget {
+  const _RoundCategoryButton({required this.label, required this.icon, required this.selected, required this.onTap});
+  final String label;
+  final IconData icon;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(999),
+      onTap: onTap,
+      child: SizedBox(
+        width: 54,
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          Container(
+            width: 46,
+            height: 46,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: selected ? const Color(0xff0f766e) : const Color(0xffe7f4f1),
+              border: Border.all(color: selected ? const Color(0xff0f766e) : const Color(0xffb7d8d2)),
+            ),
+            child: Icon(icon, color: selected ? Colors.white : const Color(0xff134e4a), size: 22),
+          ),
+          const SizedBox(height: 2),
+          Text(label, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w700)),
+        ]),
+      ),
+    );
+  }
+}
+
+class _CounterItemPanel extends StatelessWidget {
+  const _CounterItemPanel({required this.title, required this.items, required this.count, required this.onPlus, required this.onMinus, required this.onClose});
+  final String title;
+  final List<Item> items;
+  final int Function(Item) count;
+  final void Function(Item) onPlus;
+  final void Function(Item) onMinus;
+  final VoidCallback onClose;
+
+  @override
+  Widget build(BuildContext context) {
+    final sorted = [...items]..sort((a, b) => a.price == b.price ? a.name.compareTo(b.name) : a.price.compareTo(b.price));
+    return Container(
+      margin: const EdgeInsets.fromLTRB(10, 0, 10, 4),
+      padding: const EdgeInsets.fromLTRB(8, 8, 8, 6),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border.all(color: const Color(0xffd6d3d1)),
+        borderRadius: BorderRadius.circular(8),
+        boxShadow: const [BoxShadow(color: Color(0x14000000), blurRadius: 8, offset: Offset(0, -2))],
+      ),
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        Row(children: [
+          Expanded(child: Text(title, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w900))),
+          IconButton(onPressed: onClose, icon: const Icon(Icons.close)),
+        ]),
+        ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 190),
+          child: ListView.builder(
+            shrinkWrap: true,
+            itemCount: sorted.length,
+            itemBuilder: (_, index) {
+              final item = sorted[index];
+              return SizedBox(
+                height: 44,
+                child: Row(children: [
+                  Expanded(child: Text('${item.name} $rupee${item.price}', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700))),
+                  IconButton(onPressed: () => onMinus(item), icon: const Icon(Icons.remove)),
+                  SizedBox(width: 32, child: Text('${count(item)}', textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.w900))),
+                  IconButton(onPressed: () => onPlus(item), icon: const Icon(Icons.add)),
+                ]),
+              );
+            },
+          ),
+        ),
+      ]),
+    );
+  }
+}
+
+class _CounterBillList extends StatelessWidget {
+  const _CounterBillList({required this.lines, required this.total, required this.onAdd, required this.onMinus});
+  final List<BillLine> lines;
+  final int total;
+  final void Function(BillLine) onAdd;
+  final void Function(BillLine) onMinus;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 0, 12, 6),
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(8), border: Border.all(color: const Color(0xffd6d3d1))),
+      child: lines.isEmpty
+          ? const Center(child: Text('No items yet'))
+          : Column(children: [
+              Expanded(
+                child: ListView.builder(
+                  itemCount: lines.length,
+                  itemBuilder: (_, index) {
+                    final line = lines[index];
+                    return SizedBox(
+                      height: 42,
+                      child: Row(children: [
+                        Expanded(child: Text('${line.name} $rupee${line.price} x ${line.qty}', overflow: TextOverflow.ellipsis)),
+                        Text('$rupee${line.total}', style: const TextStyle(fontWeight: FontWeight.w900)),
+                        IconButton(onPressed: () => onMinus(line), icon: const Icon(Icons.remove)),
+                        IconButton(onPressed: () => onAdd(line), icon: const Icon(Icons.add)),
+                      ]),
+                    );
+                  },
+                ),
+              ),
+              Align(alignment: Alignment.centerRight, child: Text('Total = $rupee$total', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w900))),
+            ]),
     );
   }
 }
@@ -2067,6 +3069,24 @@ class ReportsPage extends StatelessWidget {
               padding: const EdgeInsets.all(12),
               children: [
                 const Text('Today', style: TextStyle(fontSize: 24, fontWeight: FontWeight.w900)),
+                const SizedBox(height: 8),
+                FilledButton.icon(
+                  onPressed: () async {
+                    try {
+                      await store.emailTodayReport();
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Today report emailed')));
+                      }
+                    } catch (error) {
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(error.toString().replaceFirst('Exception: ', ''))));
+                      }
+                    }
+                  },
+                  icon: const Icon(Icons.email),
+                  label: const Text('Email Today Report'),
+                ),
+                const SizedBox(height: 8),
                 reportTile('Total sales', '$rupee${report.totalSales}'),
                 reportTile('Cash received', '$rupee${report.cashReceived}'),
                 reportTile('UPI received', '$rupee${report.upiReceived}'),
@@ -2098,12 +3118,14 @@ class SettingsPage extends StatefulWidget {
 class _SettingsPageState extends State<SettingsPage> {
   final shopController = TextEditingController();
   final currencyController = TextEditingController();
+  final reportEmailsController = TextEditingController();
   bool loaded = false;
 
   @override
   void dispose() {
     shopController.dispose();
     currencyController.dispose();
+    reportEmailsController.dispose();
     super.dispose();
   }
 
@@ -2113,6 +3135,7 @@ class _SettingsPageState extends State<SettingsPage> {
     if (!loaded) {
       shopController.text = store.shopDisplayName;
       currencyController.text = store.currencySymbol;
+      reportEmailsController.text = store.reportOwnerEmails;
       loaded = true;
     }
     return Scaffold(appBar: AppBar(title: const Text('Settings')), body: ListView(padding: const EdgeInsets.all(16), children: [
@@ -2135,11 +3158,34 @@ class _SettingsPageState extends State<SettingsPage> {
         ),
       ),
       const SizedBox(height: 12),
+      Card(
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('Report Emails', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+            const SizedBox(height: 8),
+            TextField(
+              controller: reportEmailsController,
+              keyboardType: TextInputType.emailAddress,
+              decoration: const InputDecoration(labelText: 'Owner email IDs', helperText: 'Use comma or new line for multiple owners'),
+              minLines: 1,
+              maxLines: 3,
+            ),
+            const SizedBox(height: 8),
+            FilledButton.icon(
+              onPressed: () => context.read<PosStore>().saveReportEmails(reportEmailsController.text),
+              icon: const Icon(Icons.save),
+              label: const Text('Save Report Emails'),
+            ),
+          ]),
+        ),
+      ),
+      const SizedBox(height: 12),
       ListTile(
         title: const Text('Activation'),
         subtitle: Text(store.activated
-            ? 'Active - ${store.activationShopName} - ${store.activationMobileNumber}\nDevice ${store.deviceCode}'
-            : 'Not active - Device ${store.deviceCode}'),
+            ? 'Active - ${store.activationShopName} - ${store.activationMobileNumber}\n${store.activationExpiryMessage}\nDevice ${store.deviceCode}'
+            : '${store.activationExpiryMessage}\nDevice ${store.deviceCode}'),
         trailing: OutlinedButton(
           onPressed: () => showResetActivationDialog(context),
           child: const Text('Reset'),
@@ -2151,6 +3197,13 @@ class _SettingsPageState extends State<SettingsPage> {
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             const Text('Cloud Sync', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
             const SizedBox(height: 8),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              value: store.cloudSyncEnabled,
+              title: const Text('Enable Cloud Sync'),
+              subtitle: Text(store.cloudSyncEnabled ? 'Multi-mobile sync is on' : 'Offline-only mode'),
+              onChanged: (value) => context.read<PosStore>().setCloudSyncEnabled(value),
+            ),
             Text('Status: ${store.syncStatus}'),
             Text('API: ${kSyncApiBase.isEmpty ? 'Missing' : kSyncApiBase}'),
             Text('Shop ID: ${store.cloudShopId.isEmpty ? 'Not linked yet' : store.cloudShopId}'),
@@ -2163,21 +3216,69 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
             const SizedBox(height: 8),
             FilledButton.icon(
-              onPressed: () => context.read<PosStore>().syncNow(),
+              onPressed: store.cloudSyncEnabled ? () => context.read<PosStore>().syncNow() : null,
               icon: const Icon(Icons.sync),
               label: const Text('Sync Now'),
             ),
             const SizedBox(height: 8),
             OutlinedButton.icon(
-              onPressed: () => context.read<PosStore>().forceFullResync(),
+              onPressed: store.cloudSyncEnabled ? () => context.read<PosStore>().forceFullResync() : null,
               icon: const Icon(Icons.restart_alt),
               label: const Text('Full Resync'),
             ),
           ]),
         ),
       ),
-      const ListTile(title: Text('Backup database'), subtitle: Text('Placeholder')),
-      const ListTile(title: Text('Restore database'), subtitle: Text('Placeholder')),
+      Card(
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('Items Backup', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+            const SizedBox(height: 6),
+            const Text('Backup saves to Downloads/TeaStallPOS. Restore can select any backup JSON file.'),
+            const SizedBox(height: 10),
+            Row(children: [
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: () async {
+                    try {
+                      final path = await context.read<PosStore>().backupItemsToDownloads();
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Items backup saved: $path')));
+                      }
+                    } catch (error) {
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Backup failed: $error')));
+                      }
+                    }
+                  },
+                  icon: const Icon(Icons.backup),
+                  label: const Text('Backup Items'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: () async {
+                    try {
+                      final count = await context.read<PosStore>().restoreItemsFromFilePicker();
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Restored $count items')));
+                      }
+                    } catch (error) {
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Restore failed: $error')));
+                      }
+                    }
+                  },
+                  icon: const Icon(Icons.restore),
+                  label: const Text('Restore Items'),
+                ),
+              ),
+            ]),
+          ]),
+        ),
+      ),
       const ListTile(title: Text('Printer settings'), subtitle: Text('Bluetooth printer module later')),
     ]));
   }
