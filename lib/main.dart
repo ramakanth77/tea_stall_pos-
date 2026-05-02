@@ -969,12 +969,19 @@ class PosStore extends ChangeNotifier {
     final entity = (event['entity'] ?? '').toString();
     final clientId = (event['entity_client_id'] ?? event['entityClientId'] ?? '').toString();
     final rawPayload = event['payload'];
+    final operation = (event['operation'] ?? '').toString();
     final payload = rawPayload is Map<String, dynamic>
         ? rawPayload
         : rawPayload is Map
             ? Map<String, dynamic>.from(rawPayload)
             : <String, dynamic>{};
     if (clientId.isEmpty || payload.isEmpty) return;
+
+    if ((operation == 'delete' || payload['isDeleted'] == true) && entity == 'customer') {
+      final existingId = await _mappedLocalId(clientId);
+      if (existingId != null) await _deleteCustomerLocal(existingId);
+      return;
+    }
 
     if (entity == 'session') {
       final existingId = await _mappedLocalId(clientId);
@@ -1402,6 +1409,25 @@ class PosStore extends ChangeNotifier {
     await receivePayment(customerId, balance, mode);
   }
 
+  Future<void> deleteCustomer(int customerId) async {
+    final customerClientId = await _clientIdFor('customer', customerId);
+    await _deleteCustomerLocal(customerId);
+    await enqueueSync('customer', customerClientId, 'delete', {'isDeleted': true, 'deletedAt': DateTime.now().millisecondsSinceEpoch});
+    await reload();
+    _scheduleSyncSoon();
+  }
+
+  Future<void> _deleteCustomerLocal(int customerId) async {
+    final sessions = await _db!.query('katha_sessions', columns: ['id'], where: 'customerId = ?', whereArgs: [customerId]);
+    for (final session in sessions) {
+      await _db!.delete('katha_items', where: 'sessionId = ?', whereArgs: [session['id']]);
+    }
+    await _db!.delete('payments', where: 'customerId = ?', whereArgs: [customerId]);
+    await _db!.delete('customer_ledger', where: 'customerId = ?', whereArgs: [customerId]);
+    await _db!.delete('katha_sessions', where: 'customerId = ?', whereArgs: [customerId]);
+    await _db!.delete('customers', where: 'id = ?', whereArgs: [customerId]);
+  }
+
   Future<void> _queueCustomer(int customerId) async {
     final rows = await _db!.query('customers', where: 'id = ?', whereArgs: [customerId], limit: 1);
     if (rows.isEmpty) return;
@@ -1561,11 +1587,13 @@ class PosStore extends ChangeNotifier {
     _scheduleSyncSoon();
   }
 
-  Future<ReportData> reportsToday() async {
+  Future<ReportData> reportsToday() => reportsForDate(DateTime.now());
+
+  Future<ReportData> reportsForDate(DateTime reportDate) async {
     final db = _db!;
-    final now = DateTime.now();
-    final start = DateTime(now.year, now.month, now.day).millisecondsSinceEpoch;
-    final end = DateTime(now.year, now.month, now.day + 1).millisecondsSinceEpoch - 1;
+    final day = DateTime(reportDate.year, reportDate.month, reportDate.day);
+    final start = day.millisecondsSinceEpoch;
+    final end = day.add(const Duration(days: 1)).millisecondsSinceEpoch - 1;
     Future<int> singleInt(String sql, [List<Object?> args = const []]) async {
       return Sqflite.firstIntValue(await db.rawQuery(sql, args)) ?? 0;
     }
@@ -2922,21 +2950,25 @@ class _CustomerDetailState extends State<CustomerDetail> {
       appBar: AppBar(title: Text(fresh.name)),
       body: Column(children: [
         Padding(padding: const EdgeInsets.all(10), child: Text('Total due $rupee${fresh.balance}', style: const TextStyle(fontSize: 28, fontWeight: FontWeight.w900, color: Colors.red))),
-        Expanded(
-          child: CategoryGrid(
-            dropdownMaxHeight: 110,
-            onItem: (item) => store.addPermanentItem(fresh.id, item),
-            onMinus: (item) {
-              final line = firstOrNull((store.permanentBills[fresh.id] ?? []).where((l) => l.itemId == item.id));
-              if (line != null) store.removePermanentItem(fresh.id, line);
-            },
-            groupCounts: (item) => firstOrNull((store.permanentBills[fresh.id] ?? []).where((l) => l.itemId == item.id))?.qty ?? 0,
+        Padding(
+          padding: const EdgeInsets.fromLTRB(10, 0, 10, 8),
+          child: Row(children: [
+            Expanded(child: FilledButton(onPressed: fresh.balance <= 0 ? null : () => showFullPaymentDialog(context, fresh), child: const Text('Full Payment'))),
+            const SizedBox(width: 8),
+            Expanded(child: FilledButton(onPressed: fresh.balance <= 0 ? null : () => showPaymentDialog(context, fresh.id), child: const Text('Partial Payment'))),
+          ]),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(10, 0, 10, 8),
+          child: SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: () => showDeleteCustomerDialog(context, fresh),
+              icon: const Icon(Icons.delete_outline),
+              label: const Text('Delete Customer'),
+            ),
           ),
         ),
-        Row(children: [
-          Expanded(child: Padding(padding: const EdgeInsets.all(8), child: FilledButton(onPressed: () => showManualDialog(context, fresh.id), child: const Text('Manual Amount')))),
-          Expanded(child: Padding(padding: const EdgeInsets.all(8), child: FilledButton(onPressed: () => showPaymentDialog(context, fresh.id), child: const Text('Receive Payment')))),
-        ]),
         const Padding(
           padding: EdgeInsets.fromLTRB(12, 4, 12, 0),
           child: Align(alignment: Alignment.centerLeft, child: Text('Account History', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900))),
@@ -2973,13 +3005,44 @@ void showManualDialog(BuildContext context, int customerId) {
   ]));
 }
 
+void showFullPaymentDialog(BuildContext context, Customer customer) {
+  showDialog(context: context, builder: (_) => AlertDialog(
+    title: const Text('Full payment'),
+    content: Text('Clear ${customer.name} full due of $rupee${customer.balance}?'),
+    actions: [
+      TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+      FilledButton(onPressed: () async { await context.read<PosStore>().settlePermanentCustomer(customer.id, 'CASH'); if (context.mounted) Navigator.pop(context); }, child: const Text('Cash')),
+      FilledButton(onPressed: () async { await context.read<PosStore>().settlePermanentCustomer(customer.id, 'UPI'); if (context.mounted) Navigator.pop(context); }, child: const Text('UPI')),
+    ],
+  ));
+}
+
 void showPaymentDialog(BuildContext context, int customerId) {
   final amount = TextEditingController();
-  showDialog(context: context, builder: (_) => AlertDialog(title: const Text('Receive Payment'), content: TextField(controller: amount, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Amount')), actions: [
+  showDialog(context: context, builder: (_) => AlertDialog(title: const Text('Partial Payment'), content: TextField(controller: amount, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Amount')), actions: [
     TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
     FilledButton(onPressed: () async { await context.read<PosStore>().receivePayment(customerId, int.tryParse(amount.text) ?? 0, 'CASH'); if (context.mounted) Navigator.pop(context); }, child: const Text('Cash')),
     FilledButton(onPressed: () async { await context.read<PosStore>().receivePayment(customerId, int.tryParse(amount.text) ?? 0, 'UPI'); if (context.mounted) Navigator.pop(context); }, child: const Text('UPI')),
   ]));
+}
+
+void showDeleteCustomerDialog(BuildContext context, Customer customer) {
+  showDialog(context: context, builder: (_) => AlertDialog(
+    title: const Text('Delete customer?'),
+    content: Text('${customer.name} and this customer history will be removed from this app.'),
+    actions: [
+      TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+      FilledButton(
+        onPressed: () async {
+          await context.read<PosStore>().deleteCustomer(customer.id);
+          if (!context.mounted) return;
+          Navigator.pop(context);
+          Navigator.pop(context);
+        },
+        child: const Text('Delete'),
+      ),
+    ],
+  ));
 }
 
 class ItemsPage extends StatelessWidget {
@@ -3051,28 +3114,71 @@ void showItemDialog(BuildContext context) {
   )));
 }
 
-class ReportsPage extends StatelessWidget {
+class ReportsPage extends StatefulWidget {
   const ReportsPage({super.key});
+  @override
+  State<ReportsPage> createState() => _ReportsPageState();
+}
+
+class _ReportsPageState extends State<ReportsPage> {
+  DateTime selectedDate = DateTime.now();
+
+  bool get isToday {
+    final now = DateTime.now();
+    return selectedDate.year == now.year && selectedDate.month == now.month && selectedDate.day == now.day;
+  }
+
   @override
   Widget build(BuildContext context) {
     final store = context.watch<PosStore>();
+    final reportDay = DateTime(selectedDate.year, selectedDate.month, selectedDate.day);
     return Scaffold(
       appBar: AppBar(title: const Text('Reports')),
       body: FutureBuilder<ReportData>(
-        future: store.reportsToday(),
+        future: store.reportsForDate(reportDay),
         builder: (context, snapshot) {
           if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
           final report = snapshot.data!;
           return RefreshIndicator(
-            onRefresh: store.reload,
+            onRefresh: () async {
+              await store.reload();
+              if (mounted) setState(() {});
+            },
             child: ListView(
               padding: const EdgeInsets.all(12),
               children: [
-                const Text('Today', style: TextStyle(fontSize: 24, fontWeight: FontWeight.w900)),
+                Row(children: [
+                  IconButton(
+                    onPressed: () => setState(() => selectedDate = reportDay.subtract(const Duration(days: 1))),
+                    icon: const Icon(Icons.chevron_left),
+                  ),
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: () async {
+                        final picked = await showDatePicker(
+                          context: context,
+                          initialDate: reportDay,
+                          firstDate: DateTime(2020),
+                          lastDate: DateTime.now().add(const Duration(days: 1)),
+                        );
+                        if (picked != null && mounted) setState(() => selectedDate = picked);
+                      },
+                      icon: const Icon(Icons.calendar_today),
+                      label: Text(isToday ? 'Today' : DateFormat('dd MMM yyyy').format(reportDay), style: const TextStyle(fontWeight: FontWeight.w900)),
+                    ),
+                  ),
+                  IconButton(
+                    onPressed: isToday ? null : () => setState(() => selectedDate = reportDay.add(const Duration(days: 1))),
+                    icon: const Icon(Icons.chevron_right),
+                  ),
+                ]),
+                const SizedBox(height: 8),
+                Text(DateFormat('EEEE, dd MMM yyyy').format(reportDay), style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w900)),
                 const SizedBox(height: 8),
                 FilledButton.icon(
                   onPressed: () async {
                     try {
+                      if (!isToday) throw Exception('Email is available for today report only');
                       await store.emailTodayReport();
                       if (context.mounted) {
                         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Today report emailed')));
